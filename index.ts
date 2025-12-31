@@ -14,40 +14,96 @@ type VoiceConfig = {
     cmd?: string
     args?: string[]
   }
+  maxChars?: number
 }
 
-const normalizePathForCompare = (p: string) => p.replace(/\\/g, "/")
+type LoadedConfig = {
+  config: VoiceConfig
+  source: "project" | "global" | "none"
+}
 
-const joinTextParts = (parts: any[]) => {
+type AudioFormat = {
+  accept: string
+  ext: string
+  outputFormat: string
+}
+
+type MessageInfo = {
+  id: string
+  role: "user" | "assistant" | string
+  sessionID?: string
+}
+
+type TextPart = {
+  type: "text"
+  text: string
+  ignored?: boolean
+}
+
+type Part = TextPart | { type: string; [k: string]: unknown }
+
+type MessageWithParts = {
+  info: MessageInfo
+  parts: Part[]
+}
+
+const normalizeSlash = (p: string) => p.replace(/\\/g, "/")
+
+const isMp3OutputFormat = (value: string) => normalizeSlash(value).toLowerCase().startsWith("mp3")
+
+const audioFormatFor = (outputFormat: string | undefined): AudioFormat => {
+  const fallback = "mp3_44100_128"
+  const resolved = outputFormat && isMp3OutputFormat(outputFormat) ? outputFormat : fallback
+  return {
+    accept: "audio/mpeg",
+    ext: "mp3",
+    outputFormat: resolved,
+  }
+}
+
+const joinTextParts = (parts: Part[]) => {
   const chunks: string[] = []
   for (const part of parts ?? []) {
     if (!part || part.type !== "text") continue
-    if (part.ignored) continue
-    const text = typeof part.text === "string" ? part.text : ""
+    const textPart = part as TextPart
+    if (textPart.ignored) continue
+    const text = typeof textPart.text === "string" ? textPart.text : ""
     if (!text) continue
     chunks.push(text)
   }
   return chunks.join("").trim()
 }
 
-const defaultConfig = (partial?: VoiceConfig): Required<Pick<VoiceConfig, "enabled" | "mode" | "outputFormat" | "player">> &
-  Omit<VoiceConfig, "enabled" | "mode" | "outputFormat" | "player"> => {
+const sanitizeForTts = (text: string) => {
+  const withoutCodeBlocks = text.replace(/```[\s\S]*?```/g, " ")
+  const withoutInlineCode = withoutCodeBlocks.replace(/`[^`]*`/g, " ")
+  const withoutLinks = withoutInlineCode.replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
+  return withoutLinks.replace(/\s+/g, " ").trim()
+}
+
+const truncateForTts = (text: string, maxChars: number) => {
+  if (text.length <= maxChars) return { text, truncated: false }
+  return { text: text.slice(0, maxChars).trimEnd(), truncated: true }
+}
+
+const defaultConfig = (partial?: VoiceConfig) => {
+  const output = audioFormatFor(partial?.outputFormat)
   return {
     enabled: partial?.enabled ?? true,
     mode: partial?.mode ?? "continuous",
     language: partial?.language,
     voiceId: partial?.voiceId,
     modelId: partial?.modelId,
-    outputFormat: partial?.outputFormat ?? "mp3_44100_128",
+    outputFormat: output.outputFormat,
     player: {
       cmd: partial?.player?.cmd ?? "mpv",
       args: partial?.player?.args ?? ["--no-terminal", "--force-window=no", "--keep-open=no"],
     },
+    maxChars: partial?.maxChars ?? 3000,
   }
 }
 
-async function loadVoiceConfig(projectRoot: string): Promise<{ config: VoiceConfig; source: "project" | "global" | "none" }>
-{
+async function loadVoiceConfig(projectRoot: string): Promise<LoadedConfig> {
   const home = process.env["HOME"]
   const projectPath = join(projectRoot, ".opencode", "voice.json")
   const globalPath = home ? join(home, ".config", "opencode", "voice.json") : undefined
@@ -75,6 +131,7 @@ async function elevenLabsTts(params: {
   text: string
   modelId: string
   outputFormat: string
+  accept: string
 }): Promise<Uint8Array> {
   const url = new URL(`https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(params.voiceId)}/stream`)
   url.searchParams.set("output_format", params.outputFormat)
@@ -84,7 +141,7 @@ async function elevenLabsTts(params: {
     headers: {
       "Content-Type": "application/json",
       "xi-api-key": params.apiKey,
-      Accept: "audio/mpeg",
+      Accept: params.accept,
     },
     body: JSON.stringify({
       text: params.text,
@@ -105,26 +162,56 @@ export const OpenCodeVoice: Plugin = async ({ client, $, directory, worktree }) 
 
   const state = {
     config: defaultConfig(),
-    configSource: "none" as "project" | "global" | "none",
+    configSource: "none" as LoadedConfig["source"],
+    configFingerprint: "" as string,
     lastSessionID: undefined as string | undefined,
     disabledSessions: new Set<string>(),
     lastSpokenAssistantMessage: new Map<string, string>(),
     speaking: false,
+    pendingSpeak: undefined as undefined | { sessionID: string; reason: "idle" | "manual" },
   }
 
   const toast = async (message: string, variant: "info" | "success" | "warning" | "error" = "info") => {
     await client.tui.showToast({ message, variant }).catch(() => {})
   }
 
-  const reloadConfig = async () => {
+  const fingerprint = (cfg: ReturnType<typeof defaultConfig>, source: LoadedConfig["source"]) => {
+    const playerArgs = cfg.player.args?.join("|") ?? ""
+    return [
+      source,
+      cfg.enabled ? "1" : "0",
+      cfg.mode,
+      cfg.language ?? "",
+      cfg.voiceId ?? "",
+      cfg.modelId ?? "",
+      cfg.outputFormat,
+      cfg.player.cmd ?? "",
+      playerArgs,
+      String(cfg.maxChars ?? ""),
+    ].join(";")
+  }
+
+  const reloadConfig = async (opts: { announce: boolean }) => {
     try {
       const loaded = await loadVoiceConfig(projectRoot)
-      state.config = defaultConfig(loaded.config)
+      const cfg = defaultConfig(loaded.config)
+      const fp = fingerprint(cfg, loaded.source)
+
+      const changed = fp !== state.configFingerprint
+      state.config = cfg
       state.configSource = loaded.source
-      await toast(
-        `Voice config loaded (${loaded.source}). mode=${state.config.mode} enabled=${state.config.enabled ? "on" : "off"}`,
-        "success",
-      )
+      state.configFingerprint = fp
+
+      if (opts.announce && changed) {
+        await toast(
+          `Voice config loaded (${loaded.source}). mode=${state.config.mode} enabled=${state.config.enabled ? "on" : "off"}`,
+          "success",
+        )
+      }
+
+      if (opts.announce && !isMp3OutputFormat(loaded.config.outputFormat ?? "mp3")) {
+        await toast(`voice.json outputFormat not supported, using ${state.config.outputFormat}`, "warning")
+      }
     } catch (e) {
       await toast(`Voice config error: ${(e as Error).message}`, "error")
     }
@@ -138,22 +225,35 @@ export const OpenCodeVoice: Plugin = async ({ client, $, directory, worktree }) 
 
   const getLatestAssistant = async (sessionID: string) => {
     const list = await client.session.messages({ sessionID, limit: 25 })
-    const messages = (list.data ?? []) as Array<{ info: any; parts: any[] }>
+    const messages = (list.data ?? []) as MessageWithParts[]
+
     for (let i = messages.length - 1; i >= 0; i--) {
       const msg = messages[i]
       if (!msg?.info) continue
       if (msg.info.role !== "assistant") continue
-      const text = joinTextParts(msg.parts)
-      if (!text) continue
-      return { messageID: msg.info.id as string, text }
+
+      const fullText = joinTextParts(msg.parts)
+      const sanitized = sanitizeForTts(fullText)
+      if (!sanitized) continue
+
+      const maxChars = Math.max(200, state.config.maxChars ?? 3000)
+      const truncated = truncateForTts(sanitized, maxChars)
+
+      return {
+        messageID: msg.info.id,
+        text: truncated.text,
+        truncated: truncated.truncated,
+      }
     }
+
     return undefined
   }
 
-  const playAudio = async (bytes: Uint8Array) => {
+  const playAudio = async (bytes: Uint8Array, ext: string) => {
     const tmp = process.env["TMPDIR"] || "/tmp"
-    const filename = `opencode-voice-${Date.now()}-${Math.random().toString(16).slice(2)}.mp3`
+    const filename = `opencode-voice-${Date.now()}-${Math.random().toString(16).slice(2)}.${ext}`
     const filePath = join(tmp, filename)
+
     await Bun.write(filePath, bytes)
 
     const cmd = state.config.player.cmd
@@ -172,7 +272,11 @@ export const OpenCodeVoice: Plugin = async ({ client, $, directory, worktree }) 
 
   const speakSession = async (sessionID: string, reason: "idle" | "manual") => {
     if (!isEnabledForSession(sessionID)) return
-    if (state.speaking) return
+
+    if (state.speaking) {
+      state.pendingSpeak = { sessionID, reason }
+      return
+    }
 
     const apiKey = process.env["ELEVENLABS_API_KEY"]
     if (!apiKey) {
@@ -186,6 +290,7 @@ export const OpenCodeVoice: Plugin = async ({ client, $, directory, worktree }) 
       return
     }
 
+    const format = audioFormatFor(state.config.outputFormat)
     const modelId = state.config.modelId || (state.config.language ? "eleven_multilingual_v2" : "eleven_turbo_v2_5")
 
     state.speaking = true
@@ -198,31 +303,41 @@ export const OpenCodeVoice: Plugin = async ({ client, $, directory, worktree }) 
         if (last === latest.messageID) return
       }
 
+      if (latest.truncated) {
+        await toast(`Voice: truncated to ${state.config.maxChars} chars`, "warning")
+      }
+
       const bytes = await elevenLabsTts({
         apiKey,
         voiceId,
         text: latest.text,
         modelId,
-        outputFormat: state.config.outputFormat,
+        outputFormat: format.outputFormat,
+        accept: format.accept,
       })
 
-      await playAudio(bytes)
+      await playAudio(bytes, format.ext)
 
       state.lastSpokenAssistantMessage.set(sessionID, latest.messageID)
     } catch (e) {
       await toast(`Voice error: ${(e as Error).message}`, "error")
     } finally {
       state.speaking = false
+      const pending = state.pendingSpeak
+      state.pendingSpeak = undefined
+      if (pending) {
+        await speakSession(pending.sessionID, pending.reason)
+      }
     }
   }
 
-  await reloadConfig()
+  await reloadConfig({ announce: true })
 
   const handleCommand = async (command: string) => {
     const sessionID = state.lastSessionID
 
     if (command === "voice.reload") {
-      await reloadConfig()
+      await reloadConfig({ announce: true })
       return
     }
 
@@ -274,6 +389,11 @@ export const OpenCodeVoice: Plugin = async ({ client, $, directory, worktree }) 
     }
   }
 
+  const resolveAbsoluteWatchedFile = (file: string) => {
+    if (isAbsolute(file)) return normalizeSlash(file)
+    return normalizeSlash(join(projectRoot, file))
+  }
+
   return {
     event: async ({ event }) => {
       const payload = (event as any).payload ?? event
@@ -294,6 +414,14 @@ export const OpenCodeVoice: Plugin = async ({ client, $, directory, worktree }) 
         return
       }
 
+      if (payload.type === "session.deleted") {
+        const sessionID = payload.properties?.sessionID as string | undefined
+        if (!sessionID) return
+        state.disabledSessions.delete(sessionID)
+        state.lastSpokenAssistantMessage.delete(sessionID)
+        return
+      }
+
       if (payload.type === "tui.command.execute") {
         const cmd = payload.properties?.command as string | undefined
         if (!cmd) return
@@ -306,19 +434,15 @@ export const OpenCodeVoice: Plugin = async ({ client, $, directory, worktree }) 
         const file = payload.properties?.file as string | undefined
         if (!file) return
 
-        const normalized = normalizePathForCompare(file)
-        const projectConfig = normalizePathForCompare(join(projectRoot, ".opencode", "voice.json"))
+        const normalized = resolveAbsoluteWatchedFile(file)
+
+        const projectConfig = normalizeSlash(join(projectRoot, ".opencode", "voice.json"))
 
         const home = process.env["HOME"]
-        const globalConfig = home ? normalizePathForCompare(join(home, ".config", "opencode", "voice.json")) : undefined
+        const globalConfig = home ? normalizeSlash(join(home, ".config", "opencode", "voice.json")) : undefined
 
-        const samePath = (candidate: string) => {
-          if (isAbsolute(candidate)) return normalizePathForCompare(candidate) === normalized
-          return normalizePathForCompare(join(projectRoot, candidate)) === normalized
-        }
-
-        if (samePath(projectConfig) || (globalConfig && samePath(globalConfig))) {
-          await reloadConfig()
+        if (normalized === projectConfig || (globalConfig && normalized === globalConfig)) {
+          await reloadConfig({ announce: false })
         }
         return
       }

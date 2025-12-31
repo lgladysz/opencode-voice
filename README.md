@@ -38,6 +38,7 @@ Example:
   "voiceId": "YOUR_ELEVENLABS_VOICE_ID",
   "modelId": "eleven_multilingual_v2",
   "outputFormat": "mp3_44100_128",
+  "maxChars": 3000,
   "player": {
     "cmd": "mpv",
     "args": ["--no-terminal", "--force-window=no", "--keep-open=no"]
@@ -48,6 +49,8 @@ Example:
 Notes:
 - `mode: "continuous"` speaks automatically on `session.idle`.
 - `mode: "push-to-talk"` never auto-speaks; use `voice.speak`.
+- `outputFormat` is currently mp3-only (`mp3_*`).
+- Text is sanitized (markdown/code removed) and truncated to `maxChars`.
 
 ## Commands (plugin-only)
 
