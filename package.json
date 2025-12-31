@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json.schemastore.org/package.json",
+  "name": "opencode-voice",
+  "version": "0.0.1",
+  "description": "Voice/TTS plugin for OpenCode",
+  "type": "module",
+  "license": "MIT",
+  "author": "Łukasz Gładysz",
+  "packageManager": "bun@1.3.1",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lgladysz/opencode-voice.git"
+  },
+  "keywords": [
+    "opencode",
+    "plugin",
+    "voice",
+    "tts"
+  ],
+  "homepage": "https://github.com/lgladysz/opencode-voice#readme",
+  "bugs": {
+    "url": "https://github.com/lgladysz/opencode-voice/issues"
+  },
+  "scripts": {
+    "build": "bun build ./index.ts --outdir ./dist --target node",
+    "prepublishOnly": "bun run build",
+    "test": "bun test"
+  },
+  "module": "./dist/index.js",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "require": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist/",
+    "README.md",
+    "LICENSE"
+  ],
+  "devDependencies": {
+    "@tsconfig/bun": "^1.0.9",
+    "@types/bun": "^1.3.1",
+    "bun-types": "^1.3.1",
+    "@opencode-ai/plugin": "^1.0.214"
+  },
+  "peerDependencies": {
+    "typescript": "^5.9.3",
+    "@opencode-ai/plugin": "^1.0.214"
+  },
+  "dependencies": {
+  }
+}
